@@ -1,0 +1,25 @@
+train_file: [data/finetune/ucm_train_data.json]
+test_file: data/finetune/ucm_test_data.json
+val_file: data/finetune/ucm_val_data.json
+image_root: ./data/
+
+seed: 42
+image_res: 224
+batch_size_train: 32
+batch_size_test: 64
+batch_size_test_text: 64
+
+model: vit
+if_evaluation: true
+fusion_dim: 512
+num_bins: 15
+k: 40
+
+optimizer: {opt: adamW, lr: 1.0e-5, weight_decay: 0.04, lr_mult: 2}
+schedular: {sched: linear_cos, max_lr: 1.0e-5, min_lr: 1.0e-6, epochs: 30, num_warmup_steps: 0.1}
+
+weight_init_imagegamma: 1.0
+weight_init_textgamma: 1.0
+themaxgamma: 3.0
+themingamma: 0.0
+soft_alpha: 0.8

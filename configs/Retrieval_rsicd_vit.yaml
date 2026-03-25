@@ -1,0 +1,31 @@
+############## The train & val & test set root ##############
+train_file: [data/finetune/rsicd_train.json]      
+test_file: data/finetune/rsicd_test.json          
+val_file: data/finetune/rsicd_val.json            
+image_root: ./data/                               
+
+################ Training setting ################
+seed: 42 
+image_res: 224
+batch_size_train: 32
+batch_size_test: 64
+batch_size_test_text: 64
+
+model: vit
+if_evaluation: true
+fusion_dim: 512
+num_bins: 15
+k: 40
+
+# 【核心修改】：彻底关闭差分学习率 (lr_mult: 1.0)，并将 weight_decay 统一为 0.04
+optimizer: {opt: adamW, lr: 1.0e-5, weight_decay: 0.04, lr_mult: 2.0}
+
+# 恢复 30 Epoch，正常 Warmup
+schedular: {sched: linear_cos, max_lr: 1.0e-5, min_lr: 1.0e-6, epochs: 30, num_warmup_steps: 0.1}
+
+################ Model setting  ################
+weight_init_imagegamma: 1.0
+weight_init_textgamma: 1.0
+themaxgamma: 3.0
+themingamma: 0.0
+soft_alpha: 0.8
