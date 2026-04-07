@@ -67,11 +67,6 @@ def train(model, data_loader, optimizer, tokenizer, epoch, device, scheduler, co
         optimizer.zero_grad()
         loss.backward()
 
-        # 🛡️ 终极防爆护盾5：梯度级净化 (保护预训练权重不被污染)
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=1e4, neginf=-1e4)
-
         # 梯度裁剪防爆器
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -279,7 +274,7 @@ def main(args, config):
     preprocess_train, preprocess_val = model.preprocess_train, model.preprocess_val
     print("Creating retrieval dataset", flush=True)
     train_dataset, val_dataset, test_dataset = create_dataset('re', config, args.evaluate, preprocess_train,
-                                                              preprocess_val)
+                                                                preprocess_val)
     start_time = time.time()
     print("### output_dir, ", args.output_dir, flush=True)
     model.train()
@@ -290,13 +285,13 @@ def main(args, config):
     samplers = [None, None, None, None]
 
     train_loader, val_loader, test_loader = create_loader([train_dataset, val_dataset, test_dataset], samplers,
-                                                      batch_size=[config['batch_size_train']] * 3,
-                                                      num_workers=[0, 0, 0],
-                                                      is_trains=[True, False, False],
-                                                      collate_fns=[dataset_collate, dataset_collate,
-                                                                   dataset_collate])
+                                                           batch_size=[config['batch_size_train']] * 3,
+                                                           num_workers=[0, 0, 0],
+                                                           is_trains=[True, False, False],
+                                                           collate_fns=[dataset_collate, dataset_collate,
+                                                                        dataset_collate])
 
-# ================= 🚀 终极改进：差分学习率 (保护 RS5M 权重) =================
+    # ================= 🚀 终极改进：差分学习率 (保护 RS5M 权重) =================
     pretrained_params = []
     scratch_params = []
     for name, param in model.named_parameters():
@@ -309,17 +304,17 @@ def main(args, config):
         else:
             scratch_params.append(param)
 
-# ⚠️ 注意这里：必须和上面的 for 循环对齐（退格出去）！
+    # ⚠️ 注意这里：必须和上面的 for 循环对齐（退格出去）！
     base_lr = float(config['optimizer'].get('lr', 1e-5))
     weight_decay = float(config['optimizer'].get('weight_decay', 0.04))
 
-# 将底层和上层的参数全部合并，取消任何特权！
+    # 将底层和上层的参数全部合并，取消任何特权！
     all_params = pretrained_params + scratch_params
 
-# 没有任何学习率分组，统一使用 base_lr
+    # 没有任何学习率分组，统一使用 base_lr
     optimizer = torch.optim.AdamW(all_params, lr=base_lr, weight_decay=weight_decay)
 
-# =================================================================================
+    # =================================================================================
     arg_sche = utils.AttrDict(config['schedular'])
     arg_sche['step_per_epoch'] = math.ceil(train_dataset_size / (config['batch_size_train'] * world_size))
     lr_scheduler = create_scheduler(arg_sche, optimizer)
@@ -332,6 +327,7 @@ def main(args, config):
         train_stats = train(model, train_loader, optimizer, tokenizer, epoch, device, lr_scheduler, config)
 
         with torch.no_grad():
+            # 1. 跑验证集 (k=0，极速) 只算 ECE 和更新 Gamma，不再强行算 R@K
             score_val_i2t, score_val_t2i = evaluation(model_without_ddp, val_loader, tokenizer, device, config, k=0)
             image_text_ece, image_text_bin_dict, text_image_ece, text_image_bin_dict, image_text_meancalibration_gap, text_image_meancalibration_gap = evaluate_dataset_ECE_error(
                 score_val_i2t, score_val_t2i, val_loader.dataset.img2txt, val_loader.dataset.txt2img,
@@ -353,13 +349,13 @@ def main(args, config):
 
         WeightsoftCEloss.updategamma(image_text_meancalibration_gap, text_image_meancalibration_gap)
 
-        # ============ 🚀 速度优化：合并测试集评估，拒绝重复计算！============
-        if epoch >= 5:
-            # 1. 统一只调用一次 evaluation (k=40)
+        # ============ 🚀 仅在 Epoch >= 5 时，计算测试集的 检索指标 + ECE ============
+        if epoch >= 10:
+            # 1. 测试集提取特征 (k=40，做重排序)
             score_test_i2t, score_test_t2i = evaluation(model_without_ddp, test_loader, tokenizer, device, config,
                                                         k=config['k'])
 
-            # 2. 计算 ECE (用于记录日志)
+            # 2. 计算测试集 ECE
             image_text_ece_t, image_text_bin_dict_t, text_image_ece_t, text_image_bin_dict_t, image_text_meancalibration_gap_t, text_image_meancalibration_gap_t = evaluate_dataset_ECE_error(
                 score_test_i2t, score_test_t2i, test_loader.dataset.img2txt, test_loader.dataset.txt2img,
                 num_bins=config['num_bins'])
@@ -379,18 +375,23 @@ def main(args, config):
                 with open(os.path.join(args.output_dir + time_dir, "test_calibration_dict.txt"), "a") as f:
                     f.write(json.dumps(calibration_dict_t) + "\n")
 
-                # 3. 计算真正的检索指标 (R@1, R@5, mR...)
+                # 3. 🚀 计算真正的检索指标 (R@1, R@5, mR...)
                 test_result = itm_eval(score_test_i2t, score_test_t2i, test_loader.dataset.txt2img,
                                        test_loader.dataset.img2txt)
+
+                # 4. 把 ECE 塞进结果字典 (这就能恢复只有一个输出的纯净状态)
+                test_result['ECE_mean'] = round(mean_adaece_t, 4)
+
                 print(test_result)
 
                 log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                              **{f'test_{k}': v for k, v in test_result.items()},
                              'epoch': epoch}
+
                 with open(os.path.join(args.output_dir + time_dir, filename), "a") as f:
                     f.write(json.dumps(log_stats) + "\n")
 
-                # 4. 保存最高分权重
+                # 5. 保存最高分权重 (基于 r_mean)
                 if test_result['r_mean'] > best:
                     save_obj = {
                         'model': model_without_ddp.state_dict(),
@@ -419,6 +420,9 @@ def main(args, config):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('### Time {}'.format(total_time_str))
 
+    if utils.is_main_process():
+        print(f"Training complete. Best Epoch: {best_epoch}, Best r_mean: {best}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -444,7 +448,7 @@ if __name__ == '__main__':
     Path(args.output_dir + time_dir).mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     WeightsoftCEloss = Weight_soft_CEloss(imagegamma=config['weight_init_imagegamma'],
-                                          textgamma=config['weight_init_textgamma'], maxgamma=config['themaxgamma'],
-                                          mingamma=config['themingamma'])
+                                            textgamma=config['weight_init_textgamma'], maxgamma=config['themaxgamma'],
+                                            mingamma=config['themingamma'])
     yaml.dump(config, open(os.path.join(args.output_dir + time_dir, 'config.yaml'), 'w'))
     main(args, config)
