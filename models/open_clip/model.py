@@ -1,5 +1,5 @@
 """ CLIP Model
-
+as
 Adapted from https://github.com/openai/CLIP. Originally MIT License, Copyright (c) 2021 OpenAI.
 """
 import copy
@@ -100,9 +100,7 @@ class PatchGCN(nn.Module):
             nn.Linear(dim, dim)
         )
         
-        # ⚠️ 【消融实验修改】：关闭零初始化，改成 1.0 (让模型一开始就强制承受 GCN 的信息冲击)
-        # self.gamma_gcn = nn.Parameter(torch.zeros(1))  <-- 原来的保留注释掉
-        self.gamma_gcn = nn.Parameter(torch.ones(1))     # <-- 消融实验用的纯净版
+        self.gamma_gcn = nn.Parameter(torch.zeros(1))     # <-- 消融实验用的纯净版零初始化
 
     def forward(self, x):
         attn = torch.bmm(x, x.transpose(1, 2)) / math.sqrt(x.size(-1))
@@ -111,7 +109,6 @@ class PatchGCN(nn.Module):
         msg = torch.bmm(A, x) 
         msg = self.msg_proj(msg)
         
-        # 如果 gamma_gcn 是 1，这里就是普通的 x + msg，没有任何前期保护了
         return x + self.gamma_gcn * msg
 
 
@@ -132,7 +129,7 @@ class TGSA(nn.Module):
             nn.Linear(img_dim, img_dim)
         )
         self.ln = nn.LayerNorm(img_dim)
-        self.gamma = nn.Parameter(torch.ones(1))
+        self.gamma = nn.Parameter(torch.zeros(1))  # 零初始化
         
     def forward(self, img_feat, text_global):
         B, N, D = img_feat.shape
@@ -178,9 +175,6 @@ def _build_vision_tower(
     if isinstance(vision_cfg, dict):
         vision_cfg = CLIPVisionCfg(**vision_cfg)
 
-    # OpenAI models are pretrained w/ QuickGELU but native nn.GELU is both faster and more
-    # memory efficient in recent PyTorch releases (>= 1.10).
-    # NOTE: timm models always use native GELU regardless of quick_gelu flag.
     act_layer = QuickGELU if quick_gelu else nn.GELU
 
     if vision_cfg.timm_model_name:
@@ -352,7 +346,7 @@ class CLIP(nn.Module):
     
     @torch.no_grad()    
     def copy_params(self):
-        for model_pair in self.model_pairs:           
+        for model_pair in self.model_pairs:            
             if isinstance(model_pair[0], nn.Module) and isinstance(model_pair[1], nn.Module):
                 for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
                     param_m.data.copy_(param.data)  
@@ -402,7 +396,6 @@ class CLIP(nn.Module):
         return topk_indices
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
-        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
         self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
 
     @torch.jit.ignore
@@ -492,6 +485,7 @@ class CLIP(nn.Module):
             image_logits += self.logit_bias
         text_logits = image_logits.T
         return image_logits, text_logits
+
     def forward(
             self,
             image: Optional[torch.Tensor] = None,
@@ -500,11 +494,13 @@ class CLIP(nn.Module):
     ):
         image_features = self.encode_image(image, normalize=True) if image is not None else None
         text_features = self.encode_text(text, normalize=True) if text is not None else None
-        img_locals = self.encode_image(image, embeds=True)
         device = image_features.device
         
-        # 恢复 57.67% 的隐式对抗正则化：全局高亮
-        img_locals = self.tgsa(img_locals, text_features)
+        # ================= 🚀 1. 提取最纯净的原始特征 (消除 ASMR 越权) =================
+        img_locals_raw = self.encode_image(image, embeds=True)
+        
+        # ================= 🚀 2. 规规矩矩的 正样本 高亮 =================
+        img_locals_pos = self.tgsa(img_locals_raw, text_features)
 
         with torch.no_grad():
             self._momentum_update()
@@ -516,21 +512,18 @@ class CLIP(nn.Module):
             sim_i2t_m = logit_scale_clamped.exp() * image_feat_m @ text_feat_all
             sim_t2i_m = logit_scale_clamped.exp() * text_feat_m @ image_feat_all
             
-            # ================= 🚀 38.05% SOTA 核心：带严格阈值截断的自相似度软标签 =================
+            # ================= 🚀 软标签生成 =================
             sim_targets = torch.zeros(sim_i2t_m.size(), device=device)
             sim_targets.fill_diagonal_(1.0)
             
-            # 1. 计算图像-图像自相似度 (必须加高阈值截断)
             sim_i2i = image_feat_m @ image_feat_m.t()  
             sim_i2i = torch.where(sim_i2i > 0.85, sim_i2i, torch.zeros_like(sim_i2i))    
             sim_i2i.fill_diagonal_(0.0)                
             
-            # 2. 计算文本-文本自相似度
             sim_t2t = text_feat_m @ text_feat_m.t()    
             sim_t2t = torch.where(sim_t2t > 0.85, sim_t2t, torch.zeros_like(sim_t2t))
             sim_t2t.fill_diagonal_(0.0)
             
-            # 3. 动态软标签生成：缔造 38.05% 奇迹的原版公式 (系数 0.5 + L1 归一化)
             alpha_label = 0.8 
             
             soft_targets_i2t = sim_targets + sim_t2t * 0.5 
@@ -540,34 +533,35 @@ class CLIP(nn.Module):
             soft_targets_t2i = sim_targets + sim_i2i * 0.5
             soft_targets_t2i = F.normalize(soft_targets_t2i, p=1, dim=1)
             sim_t2i_targets = (1 - alpha_label) * F.softmax(sim_t2i_m, dim=1) + alpha_label * soft_targets_t2i
-            # =========================================================================================
 
-            # ================= 🚀 终极杀器：负样本专属信息熵 (Negative-only Entropy) =================
+            # ================= 🚀 AANE: 负样本专属信息熵 =================
             import math
             bs_size = sim_i2t_m.size(0)
             
-            # 1. 图搜文方向的负熵
             prob_i2t = F.softmax(sim_i2t_m, dim=1)
-            mask = torch.ones_like(prob_i2t) - torch.eye(bs_size, device=device) # 挖掉正样本
+            mask = torch.ones_like(prob_i2t) - torch.eye(bs_size, device=device)
             prob_i2t_neg = prob_i2t * mask
-            prob_i2t_neg = prob_i2t_neg / (prob_i2t_neg.sum(dim=1, keepdim=True) + 1e-8) # 重新归一化负样本
-            entropy_i = -torch.sum(prob_i2t_neg * torch.log(prob_i2t_neg + 1e-8), dim=1)
-            entropy_i_norm = entropy_i / math.log(bs_size - 1 + 1e-8) # 归一化
             
-            # 2. 文搜图方向的负熵
+            sum_prob_i2t = torch.clamp(prob_i2t_neg.sum(dim=1, keepdim=True), min=1e-8)
+            prob_i2t_neg = prob_i2t_neg / sum_prob_i2t
+            entropy_i = -torch.sum(prob_i2t_neg * torch.log(torch.clamp(prob_i2t_neg, min=1e-8)), dim=1)
+            entropy_i_norm = entropy_i / math.log(bs_size - 1 + 1e-8)
+            
             prob_t2i = F.softmax(sim_t2i_m, dim=1)
             prob_t2i_neg = prob_t2i * mask
-            prob_t2i_neg = prob_t2i_neg / (prob_t2i_neg.sum(dim=1, keepdim=True) + 1e-8)
-            entropy_t = -torch.sum(prob_t2i_neg * torch.log(prob_t2i_neg + 1e-8), dim=1)
+            
+            sum_prob_t2i = torch.clamp(prob_t2i_neg.sum(dim=1, keepdim=True), min=1e-8)
+            prob_t2i_neg = prob_t2i_neg / sum_prob_t2i
+            entropy_t = -torch.sum(prob_t2i_neg * torch.log(torch.clamp(prob_t2i_neg, min=1e-8)), dim=1)
             entropy_t_norm = entropy_t / math.log(bs_size - 1 + 1e-8)
-            # =========================================================================================
 
         # ------------------------- 损失计算与组合 -------------------------
-        pos_itm_input = self.encode_weight_image(text, img_locals)
+        # ================= 🚀 3. 正样本送入 ITM (使用 img_locals_pos) =================
+        pos_itm_input = self.encode_weight_image(text, img_locals_pos)
+        
         logits_per_image = self.logit_scale.exp() * image_features @ text_feat_all + self.logit_bias
         logits_per_text = self.logit_scale.exp() * text_features @ image_feat_all + self.logit_bias
         
-        # 结合 NoE 信息熵动态权重计算 Loss
         if WeightsoftCEloss is not None:
             itc_loss = (WeightsoftCEloss(logits_per_image, sim_i2t_targets, ambiguity=entropy_i_norm) + 
                         WeightsoftCEloss(logits_per_text, sim_t2i_targets, text_to_image=True, ambiguity=entropy_t_norm)) / 2.0
@@ -578,36 +572,59 @@ class CLIP(nn.Module):
         
         bs = image.size(0)
         with torch.no_grad():
-            # ... 后续代码完全不变 ...
-            # sim_i2t_m: [bs, bs] 图像->文本; sim_t2i_m: [bs, bs] 文本->图像
-            # weights_i2t 用于从文本中采负样本（给每张图找困难负文本），应用 sim_i2t_m
             sim_i2t_slice = sim_i2t_m[:, :bs].clone()
-            sim_i2t_slice = torch.nan_to_num(sim_i2t_slice, nan=0.0, posinf=0.0, neginf=0.0)
-            weights_i2t = F.softmax(sim_i2t_slice, dim=1) + 1e-8
+            sim_i2t_slice = torch.nan_to_num(sim_i2t_slice, nan=0.0, posinf=0.0, neginf=0.0) 
+            weights_i2t = F.softmax(sim_i2t_slice, dim=1)
             weights_i2t.fill_diagonal_(0)
-            # weights_t2i 用于从图像中采负样本（给每条文本找困难负图像），应用 sim_t2i_m
+            weights_i2t = torch.where(weights_i2t.sum(dim=1, keepdim=True) > 1e-8, weights_i2t, torch.ones_like(weights_i2t))
+            weights_i2t.fill_diagonal_(0)
+            
             sim_t2i_slice = sim_t2i_m[:, :bs].clone()
             sim_t2i_slice = torch.nan_to_num(sim_t2i_slice, nan=0.0, posinf=0.0, neginf=0.0)
-            weights_t2i = F.softmax(sim_t2i_slice, dim=1) + 1e-8
+            weights_t2i = F.softmax(sim_t2i_slice, dim=1)
             weights_t2i.fill_diagonal_(0)
-        images_neg = []    
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_t2i[b], 1).item()
-            images_neg.append(img_locals[neg_idx])
-        images_neg = torch.stack(images_neg,dim=0)   
+            weights_t2i = torch.where(weights_t2i.sum(dim=1, keepdim=True) > 1e-8, weights_t2i, torch.ones_like(weights_t2i))
+            weights_t2i.fill_diagonal_(0)
+            
+        # ================= 🚀 4. 规规矩矩的负样本构建：各自拿各自的原始特征 =================
+        images_neg_raw = []    
         texts_neg = []
+        texts_neg_features = []
+        
         for b in range(bs):
-            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
-            texts_neg.append(text[neg_idx])
-        texts_neg = torch.stack(texts_neg,dim=0)
-        neg_img_itm_input = self.encode_weight_image(texts_neg, img_locals)
-        neg_txt_itm_input = self.encode_weight_image(text, images_neg)
+            # 为正文本采负图像 -> 拿原图！
+            neg_idx_t2i = torch.multinomial(weights_t2i[b], 1).item()
+            images_neg_raw.append(img_locals_raw[neg_idx_t2i]) 
+            
+            # 为正图像采负文本 -> 拿负文！
+            neg_idx_i2t = torch.multinomial(weights_i2t[b], 1).item()
+            texts_neg.append(text[neg_idx_i2t])
+            texts_neg_features.append(text_features[neg_idx_i2t])
+            
+        images_neg_raw = torch.stack(images_neg_raw, dim=0)   
+        texts_neg = torch.stack(texts_neg, dim=0)
+        texts_neg_features = torch.stack(texts_neg_features, dim=0)
+        
+        # ================= 🚀 5. 规矩的对称式高亮生成 =================
+        # 负文本 高亮 原图像
+        img_locals_neg_txt = self.tgsa(img_locals_raw, texts_neg_features)
+        # 正文本 高亮 负图像
+        img_locals_neg_img = self.tgsa(images_neg_raw, text_features)
+
+        # ================= 🚀 6. 规矩的 ITM 输入 =================
+        neg_img_itm_input = self.encode_weight_image(texts_neg, img_locals_neg_txt)
+        neg_txt_itm_input = self.encode_weight_image(text, img_locals_neg_img)
+        # ==============================================================================
+        
         pos_labels = torch.ones(bs, device=device)
         neg_batch_labels = torch.zeros(2*bs, device=device)
         itm_labels = torch.cat([pos_labels, neg_batch_labels], dim=0).long()
+        
         itm_logit = self.itm_head(torch.cat([pos_itm_input, neg_img_itm_input, neg_txt_itm_input], dim=0))
-        itm_loss = nn.CrossEntropyLoss()(itm_logit,itm_labels)
+        itm_loss = nn.CrossEntropyLoss()(itm_logit, itm_labels)
+        
         total_loss += itm_loss
+        
         out_dict = {
             "total_loss": total_loss
         }
@@ -641,7 +658,6 @@ class CustomTextCLIP(nn.Module):
             self.logit_bias = None
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
-        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
         self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
 
     def lock_text_tower(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True):
@@ -708,13 +724,11 @@ def convert_weights_to_lp(model: nn.Module, dtype=torch.float16):
                     tensor.data = tensor.data.to(dtype)
 
         if isinstance(l, (CLIP, TextTransformer)):
-            # convert text nn.Parameter projections
             attr = getattr(l, "text_projection", None)
             if attr is not None:
                 attr.data = attr.data.to(dtype)
 
         if isinstance(l, VisionTransformer):
-            # convert vision nn.Parameter projections
             attr = getattr(l, "proj", None)
             if attr is not None:
                 attr.data = attr.data.to(dtype)
@@ -722,13 +736,11 @@ def convert_weights_to_lp(model: nn.Module, dtype=torch.float16):
     model.apply(_convert_weights)
 
 
-convert_weights_to_fp16 = convert_weights_to_lp  # backwards compat
+convert_weights_to_fp16 = convert_weights_to_lp  
 
 
-# used to maintain checkpoint compatibility
 def convert_to_custom_text_state_dict(state_dict: dict):
     if 'text_projection' in state_dict:
-        # old format state_dict, move text tower -> .text
         new_state_dict = {}
         for k, v in state_dict.items():
             if any(k.startswith(p) for p in (
@@ -792,18 +804,16 @@ def build_model_from_openai_state_dict(
         embed_dim,
         vision_cfg=vision_cfg,
         text_cfg=text_cfg,
-        quick_gelu=quick_gelu,  # OpenAI models were trained with QuickGELU
+        quick_gelu=quick_gelu,
         cast_dtype=cast_dtype,
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         state_dict.pop(key, None)
-    convert_weights_to_fp16(model)  # OpenAI state dicts are partially converted to float16
+    convert_weights_to_fp16(model) 
     load_result = model.load_state_dict(state_dict, strict=False)
     missing_keys = load_result.missing_keys
     unexpected_keys = load_result.unexpected_keys
-    # print(f"missing keys: {missing_keys}")
-    # print(f"unexpected keys: {unexpected_keys}")
     return model.eval()
 
 
@@ -824,12 +834,11 @@ def trace_model(model, batch_size=256, device=torch.device('cpu')):
 
 
 def resize_pos_embed(state_dict, model, interpolation: str = 'bicubic', antialias: bool = True):
-    # Rescale the grid of position embeddings when loading from state_dict
     old_pos_embed = state_dict.get('visual.positional_embedding', None)
     if old_pos_embed is None or not hasattr(model.visual, 'grid_size'):
         return
     grid_size = to_2tuple(model.visual.grid_size)
-    extra_tokens = 1  # FIXME detect different token configs (ie no class token, or more)
+    extra_tokens = 1 
     new_seq_len = grid_size[0] * grid_size[1] + extra_tokens
     if new_seq_len == old_pos_embed.shape[0]:
         return
@@ -861,7 +870,6 @@ def resize_text_pos_embed(state_dict, model, interpolation: str = 'linear', anti
     old_pos_embed = state_dict.get('positional_embedding', None)
     if old_pos_embed is None:
         return
-    # FIXME add support for text cls_token
     model_pos_embed = getattr(model, 'positional_embedding', None)
     if model_pos_embed is None:
         model_pos_embed = getattr(model.text, 'positional_embedding', None)
@@ -893,7 +901,6 @@ def get_model_preprocess_cfg(model):
     module = getattr(model, 'visual', model)
     preprocess_cfg = getattr(module, 'preprocess_cfg', {})
     if not preprocess_cfg:
-        # use separate legacy attributes if preprocess_cfg dict not found
         size = getattr(module, 'image_size')
         if size is not None:
             preprocess_cfg['size'] = size
@@ -908,9 +915,9 @@ def get_model_preprocess_cfg(model):
 
 def set_model_preprocess_cfg(model, preprocess_cfg: Dict[str, Any]):
     module = getattr(model, 'visual', model)
-    module.image_mean = preprocess_cfg['mean']  # legacy attribute, keeping for bwd compat
-    module.image_std = preprocess_cfg['std']  # legacy attribute, keeping for bwd compat
-    module.preprocess_cfg = copy.deepcopy(preprocess_cfg)  # new attr, package all pp cfg as dict
+    module.image_mean = preprocess_cfg['mean'] 
+    module.image_std = preprocess_cfg['std'] 
+    module.preprocess_cfg = copy.deepcopy(preprocess_cfg) 
 
 
 def get_model_tokenize_cfg(model):
