@@ -490,16 +490,16 @@ class CLIP(nn.Module):
             self,
             image: Optional[torch.Tensor] = None,
             text: Optional[torch.Tensor] = None,
-            WeightsoftCEloss = None
+            WeightsoftCEloss=None
     ):
+        # 提取全局特征
         image_features = self.encode_image(image, normalize=True) if image is not None else None
         text_features = self.encode_text(text, normalize=True) if text is not None else None
         device = image_features.device
         
-        # ================= 🚀 1. 提取最纯净的原始特征 (消除 ASMR 越权) =================
+        # ================= 🚀 模块 1: TGSA (拓扑门控适配) 提取纯净特征 =================
         img_locals_raw = self.encode_image(image, embeds=True)
-        
-        # ================= 🚀 2. 规规矩矩的 正样本 高亮 =================
+        # 正样本完美高亮 (用于正对)
         img_locals_pos = self.tgsa(img_locals_raw, text_features)
 
         with torch.no_grad():
@@ -508,11 +508,12 @@ class CLIP(nn.Module):
             text_feat_m = self.encode_mtext(text)
             image_feat_all = image_feat_m.t()
             text_feat_all = text_feat_m.t()
+            
             logit_scale_clamped = torch.clamp(self.logit_scale, max=4.6052)
             sim_i2t_m = logit_scale_clamped.exp() * image_feat_m @ text_feat_all
             sim_t2i_m = logit_scale_clamped.exp() * text_feat_m @ image_feat_all
             
-            # ================= 🚀 软标签生成 =================
+            # ================= 🚀 模块 2: TIMC (动量流形校准与硬截断) =================
             sim_targets = torch.zeros(sim_i2t_m.size(), device=device)
             sim_targets.fill_diagonal_(1.0)
             
@@ -534,14 +535,13 @@ class CLIP(nn.Module):
             soft_targets_t2i = F.normalize(soft_targets_t2i, p=1, dim=1)
             sim_t2i_targets = (1 - alpha_label) * F.softmax(sim_t2i_m, dim=1) + alpha_label * soft_targets_t2i
 
-            # ================= 🚀 AANE: 负样本专属信息熵 =================
+            # ================= 🚀 模块 3: NOE-Loss (负样本专属信息熵) =================
             import math
             bs_size = sim_i2t_m.size(0)
+            mask = torch.ones_like(sim_i2t_m) - torch.eye(bs_size, device=device)
             
             prob_i2t = F.softmax(sim_i2t_m, dim=1)
-            mask = torch.ones_like(prob_i2t) - torch.eye(bs_size, device=device)
             prob_i2t_neg = prob_i2t * mask
-            
             sum_prob_i2t = torch.clamp(prob_i2t_neg.sum(dim=1, keepdim=True), min=1e-8)
             prob_i2t_neg = prob_i2t_neg / sum_prob_i2t
             entropy_i = -torch.sum(prob_i2t_neg * torch.log(torch.clamp(prob_i2t_neg, min=1e-8)), dim=1)
@@ -549,16 +549,12 @@ class CLIP(nn.Module):
             
             prob_t2i = F.softmax(sim_t2i_m, dim=1)
             prob_t2i_neg = prob_t2i * mask
-            
             sum_prob_t2i = torch.clamp(prob_t2i_neg.sum(dim=1, keepdim=True), min=1e-8)
             prob_t2i_neg = prob_t2i_neg / sum_prob_t2i
             entropy_t = -torch.sum(prob_t2i_neg * torch.log(torch.clamp(prob_t2i_neg, min=1e-8)), dim=1)
             entropy_t_norm = entropy_t / math.log(bs_size - 1 + 1e-8)
 
-        # ------------------------- 损失计算与组合 -------------------------
-        # ================= 🚀 3. 正样本送入 ITM (使用 img_locals_pos) =================
-        pos_itm_input = self.encode_weight_image(text, img_locals_pos)
-        
+        # ------------------------- 损失计算: ITC Loss (动量空间对齐) -------------------------
         logits_per_image = self.logit_scale.exp() * image_features @ text_feat_all + self.logit_bias
         logits_per_text = self.logit_scale.exp() * text_features @ image_feat_all + self.logit_bias
         
@@ -570,33 +566,30 @@ class CLIP(nn.Module):
             
         total_loss = itc_loss
         
+        # ================= 🚀 模块 4: SHR (对称语义幻觉) 负样本挖掘 =================
         bs = image.size(0)
+                        
         with torch.no_grad():
-            sim_i2t_slice = sim_i2t_m[:, :bs].clone()
-            sim_i2t_slice = torch.nan_to_num(sim_i2t_slice, nan=0.0, posinf=0.0, neginf=0.0) 
+            sim_i2t_slice = torch.nan_to_num(sim_i2t_m[:, :bs].clone(), nan=0.0, posinf=0.0, neginf=0.0) 
             weights_i2t = F.softmax(sim_i2t_slice, dim=1)
             weights_i2t.fill_diagonal_(0)
-            weights_i2t = torch.where(weights_i2t.sum(dim=1, keepdim=True) > 1e-8, weights_i2t, torch.ones_like(weights_i2t))
-            weights_i2t.fill_diagonal_(0)
+            weights_i2t = torch.where(weights_i2t.sum(dim=1, keepdim=True) > 1e-8, weights_i2t, torch.ones_like(weights_i2t) / (bs - 1))
             
-            sim_t2i_slice = sim_t2i_m[:, :bs].clone()
-            sim_t2i_slice = torch.nan_to_num(sim_t2i_slice, nan=0.0, posinf=0.0, neginf=0.0)
+            sim_t2i_slice = torch.nan_to_num(sim_t2i_m[:, :bs].clone(), nan=0.0, posinf=0.0, neginf=0.0)
             weights_t2i = F.softmax(sim_t2i_slice, dim=1)
             weights_t2i.fill_diagonal_(0)
-            weights_t2i = torch.where(weights_t2i.sum(dim=1, keepdim=True) > 1e-8, weights_t2i, torch.ones_like(weights_t2i))
-            weights_t2i.fill_diagonal_(0)
+            weights_t2i = torch.where(weights_t2i.sum(dim=1, keepdim=True) > 1e-8, weights_t2i, torch.ones_like(weights_t2i) / (bs - 1))
             
-        # ================= 🚀 4. 规规矩矩的负样本构建：各自拿各自的原始特征 =================
         images_neg_raw = []    
         texts_neg = []
         texts_neg_features = []
         
         for b in range(bs):
-            # 为正文本采负图像 -> 拿原图！
+            # 采负图 (原始无 Mask 特征)
             neg_idx_t2i = torch.multinomial(weights_t2i[b], 1).item()
             images_neg_raw.append(img_locals_raw[neg_idx_t2i]) 
             
-            # 为正图像采负文本 -> 拿负文！
+            # 采负文 (及负文特征)
             neg_idx_i2t = torch.multinomial(weights_i2t[b], 1).item()
             texts_neg.append(text[neg_idx_i2t])
             texts_neg_features.append(text_features[neg_idx_i2t])
@@ -605,16 +598,22 @@ class CLIP(nn.Module):
         texts_neg = torch.stack(texts_neg, dim=0)
         texts_neg_features = torch.stack(texts_neg_features, dim=0)
         
-        # ================= 🚀 5. 规矩的对称式高亮生成 =================
-        # 负文本 高亮 原图像
+        # 🚀 SHR 核心：强制负样本产生幻觉高亮！
+        # 让错误的文本，在原图里强行寻找目标 -> 制造逼真的假特征
         img_locals_neg_txt = self.tgsa(img_locals_raw, texts_neg_features)
-        # 正文本 高亮 负图像
+        
+        # 让正确的文本，在错误的图里强行寻找目标 -> 制造逼真的假特征
         img_locals_neg_img = self.tgsa(images_neg_raw, text_features)
 
-        # ================= 🚀 6. 规矩的 ITM 输入 =================
+        # ------------------------- 损失计算: ITM Loss (极难对抗匹配) -------------------------
+        # 1. 正对 (完美特征)
+        pos_itm_input = self.encode_weight_image(text, img_locals_pos)
+        
+        # 2. 负文对 (识破幻觉：文本B 与 文本B在图像A里强行抠出来的假目标)
         neg_img_itm_input = self.encode_weight_image(texts_neg, img_locals_neg_txt)
+        
+        # 3. 负图对 (识破幻觉：文本A 与 文本A在图像B里强行抠出来的假目标)
         neg_txt_itm_input = self.encode_weight_image(text, img_locals_neg_img)
-        # ==============================================================================
         
         pos_labels = torch.ones(bs, device=device)
         neg_batch_labels = torch.zeros(2*bs, device=device)
@@ -625,11 +624,7 @@ class CLIP(nn.Module):
         
         total_loss += itm_loss
         
-        out_dict = {
-            "total_loss": total_loss
-        }
-        return out_dict
-
+        return {"total_loss": total_loss}
 
 class CustomTextCLIP(nn.Module):
     output_dict: torch.jit.Final[bool]
